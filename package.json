@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "tcb-admin-node": "^2.0.0",
+    "tcb-admin-node": "^1.0.0",
     "pdf-lib": "1.17.1"
   }
 }
