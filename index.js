@@ -40,23 +40,6 @@ function runGs(args) {
   })
 }
 
-async function updateJob(jobId, patch) {
-  try {
-    const res = await db.collection(COLLECTION).doc(jobId).update({ data: patch })
-    return res
-  } catch (e) {
-    log('updateJob FAILED', jobId, e.message)
-    return null
-  }
-}
-
-function extractUpdated(r) {
-  if (!r) return 0
-  if (typeof r.updated === 'number') return r.updated
-  if (r.stats && typeof r.stats.updated === 'number') return r.stats.updated
-  return 0
-}
-
 async function compressLight(inputPath, outputPath) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
@@ -128,42 +111,41 @@ async function processJob(job) {
     })
 
     const now = Date.now()
-    const donePatch = {
-      status: 'done',
-      outputFileID: up.fileID,
-      originalSize: inBuf.length,
-      compressedSize: outBuf.length,
-      ratio: outBuf.length / inBuf.length,
-      finishedAt: now
-    }
-    const r = await updateJob(jobId, donePatch)
-    if (extractUpdated(r) > 0) {
+    try {
+      await db.collection(COLLECTION).doc(jobId).set({
+        data: {
+          level: job.level,
+          fileID: job.fileID,
+          createdAt: job.createdAt || now,
+          status: 'done',
+          outputFileID: up.fileID,
+          originalSize: inBuf.length,
+          compressedSize: outBuf.length,
+          ratio: outBuf.length / inBuf.length,
+          finishedAt: now
+        }
+      })
       log('done', jobId, level, inBuf.length, '->', outBuf.length)
-    } else {
-      log('done-update-0, retry via set', jobId, JSON.stringify(r))
-      try {
-        await db.collection(COLLECTION).doc(jobId).set({
-          data: {
-            level: job.level,
-            fileID: job.fileID,
-            createdAt: job.createdAt || now,
-            status: 'done',
-            outputFileID: up.fileID,
-            originalSize: inBuf.length,
-            compressedSize: outBuf.length,
-            ratio: outBuf.length / inBuf.length,
-            finishedAt: now
-          }
-        })
-        log('done(via-set)', jobId, level, inBuf.length, '->', outBuf.length)
-      } catch (se) {
-        log('DONE-WRITE-FAILED', jobId, se.message)
-      }
+    } catch (se) {
+      log('DONE-WRITE-FAILED', jobId, se.message)
     }
   } catch (e) {
     log('error', jobId, e.message)
-    const r = await updateJob(jobId, { status: 'error', error: String(e.message || e), finishedAt: Date.now() })
-    if (!r) log('ERROR-WRITE-FAILED', jobId, e.message)
+    try {
+      const now = Date.now()
+      await db.collection(COLLECTION).doc(jobId).set({
+        data: {
+          level: job.level,
+          fileID: job.fileID,
+          createdAt: job.createdAt || now,
+          status: 'error',
+          error: String(e.message || e),
+          finishedAt: now
+        }
+      })
+    } catch (se) {
+      log('ERROR-WRITE-FAILED', jobId, se.message)
+    }
   } finally {
     try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath) } catch (_) {}
     try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath) } catch (_) {}
@@ -187,26 +169,20 @@ async function pollOnce() {
       .get()
     const jobs = (res && res.data) || []
     for (const job of jobs) {
-      const claim = await updateJob(job._id, { status: 'processing', startedAt: now, attempts: (job.attempts || 0) + 1 })
-      if (extractUpdated(claim) > 0) {
+      try {
+        await db.collection(COLLECTION).doc(job._id).set({
+          data: {
+            level: job.level,
+            fileID: job.fileID,
+            createdAt: job.createdAt || now,
+            status: 'processing',
+            startedAt: now,
+            attempts: (job.attempts || 0) + 1
+          }
+        })
         await processJob(job)
-      } else {
-        log('claim-update-0, retry via set', job._id, JSON.stringify(claim))
-        try {
-          await db.collection(COLLECTION).doc(job._id).set({
-            data: {
-              level: job.level,
-              fileID: job.fileID,
-              createdAt: job.createdAt || now,
-              status: 'processing',
-              startedAt: now,
-              attempts: (job.attempts || 0) + 1
-            }
-          })
-          await processJob(job)
-        } catch (se) {
-          log('CLAIM-WRITE-FAILED', job._id, se.message)
-        }
+      } catch (se) {
+        log('CLAIM-WRITE-FAILED', job._id, se.message)
       }
     }
   } catch (e) {
@@ -217,25 +193,23 @@ async function pollOnce() {
 async function loop() {
   try {
     const staleBefore = Date.now() - STALE_JOB_MS
-    const r = await db.collection(COLLECTION)
+    const staleRes = await db.collection(COLLECTION)
       .where({ status: 'processing', startedAt: db.command.lt(staleBefore) })
-      .update({ data: { status: 'pending' } })
-    log('reset stale processing jobs', extractUpdated(r))
+      .limit(50)
+      .get()
+    const staleJobs = (staleRes && staleRes.data) || []
+    let resetCount = 0
+    for (const s of staleJobs) {
+      await db.collection(COLLECTION).doc(s._id).set({
+        data: { status: 'pending', startedAt: null, attempts: (s.attempts || 0) + 1 }
+      })
+      resetCount++
+    }
+    log('reset stale processing jobs', resetCount)
   } catch (_) {}
   while (true) {
     await pollOnce()
     await sleep(POLL_INTERVAL_MS)
-  }
-}
-
-async function selfCheck() {
-  try {
-    const testId = 'selftest_' + Date.now()
-    await db.collection(COLLECTION).doc(testId).set({ data: { _test: true, _ts: Date.now() } })
-    await db.collection(COLLECTION).doc(testId).remove()
-    log('SELF-CHECK: db WRITE ok (admin identity works)')
-  } catch (e) {
-    log('SELF-CHECK: db WRITE FAILED ->', e.message)
   }
 }
 
@@ -249,6 +223,18 @@ const server = http.createServer((req, res) => {
     res.end('not found')
   }
 })
+
+async function selfCheck() {
+  try {
+    const testId = 'selftest_' + Date.now()
+    await db.collection(COLLECTION).doc(testId).set({ data: { _test: true, _ts: Date.now() } })
+    await db.collection(COLLECTION).doc(testId).remove()
+    log('SELF-CHECK: db WRITE ok (admin identity works)')
+  } catch (e) {
+    log('SELF-CHECK: db WRITE FAILED ->', e.message)
+  }
+}
+
 server.listen(PORT, () => {
   log('listening on', PORT)
   selfCheck()
