@@ -1,6 +1,6 @@
 'use strict'
 /*
- * CloudBase Run PDF 处理服务（v17，多功能）
+ * CloudBase Run PDF 处理服务（v18，多功能）
  * 支持三种操作（job.op）：
  *   compress = 压缩（三档：light / medium / heavy）
  *   toimage  = 转图片（PDF 每页渲染成 PNG，逐页上传云存储，返回图片 fileID 列表）
@@ -63,17 +63,17 @@ function runGs(args) {
 function tmpFile(jobId, suffix) { return path.join(TMP, suffix + '_' + jobId + '.pdf') }
 
 // ---------- 压缩算法 ----------
-// light：轻度，保留文字矢量、仅做温和的流压缩与图片降采样，画质几乎不变，体积小幅下降
+// light：轻度，不降低图片分辨率，不强制嵌入/子集化字体，仅做整本重新编码与去重，体积轻微下降，文字清晰度不变
 async function compressLight(inputPath, outputPath) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
     '-sDEVICE=pdfwrite',
-    '-dCompatibilityLevel=1.4',
-    '-dColorImageDownsampleType=/Bicubic', '-dColorImageResolution=150',
-    '-dGrayImageDownsampleType=/Bicubic', '-dGrayImageResolution=150',
-    '-dMonoImageResolution=300',
-    '-dDownsampleColorImages=true', '-dDownsampleGrayImages=true',
-    '-dEmbedAllFonts=true', '-dSubsetFonts=true',
+    '-dPDFSETTINGS=/prepress',
+    '-dDownsampleColorImages=false',
+    '-dDownsampleGrayImages=false',
+    '-dDownsampleMonoImages=false',
+    '-dEmbedAllFonts=false',
+    '-dSubsetFonts=false',
     '-dDetectDuplicateImages=true',
     '-sOutputFile=' + outputPath,
     inputPath
@@ -354,7 +354,9 @@ async function selfCheck() {
     const ts = Date.now()
     await db.collection(COLLECTION).doc(testId).set({ _test: true, _ts: ts })
     const r = await db.collection(COLLECTION).doc(testId).get()
-    const ok = r && r.data && r.data._test === true && r.data._ts === ts
+    // tcb-admin-node 的 .doc(id).get() 返回 r.data 为数组，单文档在 r.data[0]
+    const doc = (r && Array.isArray(r.data)) ? r.data[0] : (r && r.data)
+    const ok = doc && doc._test === true && doc._ts === ts
     await db.collection(COLLECTION).doc(testId).remove()
     if (ok) log('SELF-CHECK: db WRITE ok (structure correct)')
     else log('SELF-CHECK: db WRITE STRUCTURE WRONG ->', JSON.stringify(r && r.data).slice(0, 200))
