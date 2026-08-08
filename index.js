@@ -64,6 +64,14 @@ async function updateJob(jobId, patch) {
   }
 }
 
+// 兼容不同 SDK 返回结构：{ updated } 或 { stats: { updated } }
+function extractUpdated(r) {
+  if (!r) return 0
+  if (typeof r.updated === 'number') return r.updated
+  if (r.stats && typeof r.stats.updated === 'number') return r.stats.updated
+  return 1 // 形状未知，默认当成功，避免误判
+}
+
 // ---------- 算法 1：轻度（保留文字矢量，整本重新编码）----------
 async function compressLight(inputPath, outputPath) {
   await runGs([
@@ -144,16 +152,40 @@ async function processJob(job) {
       fileContent: Buffer.from(outBuf)
     })
 
-    const r = await updateJob(jobId, {
+    const now = Date.now()
+    const donePatch = {
       status: 'done',
       outputFileID: up.fileID,
       originalSize: inBuf.length,
       compressedSize: outBuf.length,
       ratio: outBuf.length / inBuf.length,
-      finishedAt: Date.now()
-    })
-    if (r) log('done', jobId, level, inBuf.length, '->', outBuf.length)
-    else log('DONE-WRITE-FAILED', jobId, level, inBuf.length, '->', outBuf.length)
+      finishedAt: now
+    }
+    const r = await updateJob(jobId, donePatch)
+    if (extractUpdated(r) > 0) {
+      log('done', jobId, level, inBuf.length, '->', outBuf.length)
+    } else {
+      // update 未生效（updated:0），退而用 set 整篇覆盖，确保状态落库
+      log('done-update-0, retry via set', jobId, JSON.stringify(r))
+      try {
+        await db.collection(COLLECTION).doc(jobId).set({
+          data: {
+            level: job.level,
+            fileID: job.fileID,
+            createdAt: job.createdAt || now,
+            status: 'done',
+            outputFileID: up.fileID,
+            originalSize: inBuf.length,
+            compressedSize: outBuf.length,
+            ratio: outBuf.length / inBuf.length,
+            finishedAt: now
+          }
+        })
+        log('done(via-set)', jobId, level, inBuf.length, '->', outBuf.length)
+      } catch (se) {
+        log('DONE-WRITE-FAILED', jobId, se.message)
+      }
+    }
   } catch (e) {
     log('error', jobId, e.message)
     const r = await updateJob(jobId, { status: 'error', error: String(e.message || e), finishedAt: Date.now() })
@@ -185,10 +217,28 @@ async function pollOnce() {
     for (const job of jobs) {
       // 原子认领：pending -> processing，记录认领时间与尝试次数
       const claim = await updateJob(job._id, { status: 'processing', startedAt: now, attempts: (job.attempts || 0) + 1 })
-      if (!claim) { log('claim write FAILED', job._id); continue }
-      if (claim.stats && claim.stats.updated === 0) { log('claim lost race', job._id); continue }
-      // 认领成功，处理该任务（处理中若容器重启，10 分钟内不会被重复认领）
-      await processJob(job)
+      if (extractUpdated(claim) > 0) {
+        // 认领成功，处理该任务（处理中若容器重启，10 分钟内不会被重复认领）
+        await processJob(job)
+      } else {
+        // update 未生效，用 set 兜底认领
+        log('claim-update-0, retry via set', job._id, JSON.stringify(claim))
+        try {
+          await db.collection(COLLECTION).doc(job._id).set({
+            data: {
+              level: job.level,
+              fileID: job.fileID,
+              createdAt: job.createdAt || now,
+              status: 'processing',
+              startedAt: now,
+              attempts: (job.attempts || 0) + 1
+            }
+          })
+          await processJob(job)
+        } catch (se) {
+          log('CLAIM-WRITE-FAILED', job._id, se.message)
+        }
+      }
     }
   } catch (e) {
     log('poll error', e.message)
@@ -203,7 +253,7 @@ async function loop() {
     const r = await db.collection(COLLECTION)
       .where({ status: 'processing', startedAt: db.command.lt(staleBefore) })
       .update({ data: { status: 'pending' } })
-    log('reset stale processing jobs', (r && r.stats && r.stats.updated) || 0)
+    log('reset stale processing jobs', extractUpdated(r))
   } catch (_) {}
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -227,4 +277,5 @@ server.listen(PORT, () => {
   log('listening on', PORT)
   loop() // 启动后台 worker
 })
+
 
