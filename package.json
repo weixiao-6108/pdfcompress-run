@@ -1,0 +1,13 @@
+{
+  "name": "pdfCompressRun",
+  "version": "15.0.0",
+  "description": "CloudBase Run 压缩服务 v15 - 三档独立算法 + ghostscript 栅格化 + 异步任务",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "tcb-admin-node": "^2.0.0",
+    "pdf-lib": "1.17.1"
+  }
+}
