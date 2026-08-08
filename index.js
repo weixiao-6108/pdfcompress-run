@@ -29,6 +29,7 @@ const COLLECTION = 'compress_jobs'
 const TMP = '/tmp'
 const POLL_INTERVAL_MS = 2000
 const MAX_JOB_AGE_MS = 30 * 60 * 1000 // 30 分钟未处理视为过期
+const STALE_JOB_MS = 10 * 60 * 1000 // 任务卡在 processing 超过 10 分钟才视为失败重试（避免容器重启误重置）
 
 // 三档预设（栅格化档位使用）
 const RASTER_PRESETS = {
@@ -54,8 +55,13 @@ function runGs(args) {
 }
 
 async function updateJob(jobId, patch) {
-  try { await db.collection(COLLECTION).doc(jobId).update({ data: patch }) }
-  catch (e) { log('updateJob failed', jobId, e.message) }
+  try {
+    const res = await db.collection(COLLECTION).doc(jobId).update({ data: patch })
+    return res
+  } catch (e) {
+    log('updateJob FAILED', jobId, e.message)
+    return null
+  }
 }
 
 // ---------- 算法 1：轻度（保留文字矢量，整本重新编码）----------
@@ -138,7 +144,7 @@ async function processJob(job) {
       fileContent: Buffer.from(outBuf)
     })
 
-    await updateJob(jobId, {
+    const r = await updateJob(jobId, {
       status: 'done',
       outputFileID: up.fileID,
       originalSize: inBuf.length,
@@ -146,10 +152,12 @@ async function processJob(job) {
       ratio: outBuf.length / inBuf.length,
       finishedAt: Date.now()
     })
-    log('done', jobId, level, inBuf.length, '->', outBuf.length)
+    if (r) log('done', jobId, level, inBuf.length, '->', outBuf.length)
+    else log('DONE-WRITE-FAILED', jobId, level, inBuf.length, '->', outBuf.length)
   } catch (e) {
     log('error', jobId, e.message)
-    await updateJob(jobId, { status: 'error', error: String(e.message || e), finishedAt: Date.now() })
+    const r = await updateJob(jobId, { status: 'error', error: String(e.message || e), finishedAt: Date.now() })
+    if (!r) log('ERROR-WRITE-FAILED', jobId, e.message)
   } finally {
     // 清理临时文件，避免大文件撑爆磁盘
     try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath) } catch (_) {}
@@ -175,8 +183,11 @@ async function pollOnce() {
       .get()
     const jobs = (res && res.data) || []
     for (const job of jobs) {
-      await updateJob(job._id, { status: 'processing', startedAt: now })
-      // 不在 await 链里阻塞轮询；但单次只取一个，处理完再取下一个
+      // 原子认领：pending -> processing，记录认领时间与尝试次数
+      const claim = await updateJob(job._id, { status: 'processing', startedAt: now, attempts: (job.attempts || 0) + 1 })
+      if (!claim) { log('claim write FAILED', job._id); continue }
+      if (claim.stats && claim.stats.updated === 0) { log('claim lost race', job._id); continue }
+      // 认领成功，处理该任务（处理中若容器重启，10 分钟内不会被重复认领）
       await processJob(job)
     }
   } catch (e) {
@@ -185,9 +196,14 @@ async function pollOnce() {
 }
 
 async function loop() {
-  // 启动时先把卡在 processing 的旧任务（容器重启导致）重置为 pending，让其重试
+  // 启动时只重置「卡死」的旧任务：processing 且认领时间超过阈值，
+  // 避免容器频繁重启时把刚认领的任务又置回 pending 导致重复压缩
   try {
-    await db.collection(COLLECTION).where({ status: 'processing' }).update({ data: { status: 'pending' } })
+    const staleBefore = Date.now() - STALE_JOB_MS
+    const r = await db.collection(COLLECTION)
+      .where({ status: 'processing', startedAt: db.command.lt(staleBefore) })
+      .update({ data: { status: 'pending' } })
+    log('reset stale processing jobs', (r && r.stats && r.stats.updated) || 0)
   } catch (_) {}
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -211,3 +227,4 @@ server.listen(PORT, () => {
   log('listening on', PORT)
   loop() // 启动后台 worker
 })
+
