@@ -1,10 +1,29 @@
 'use strict'
+/*
+ * CloudBase Run PDF 处理服务（v17，多功能）
+ * 支持三种操作（job.op）：
+ *   compress = 压缩（三档：light / medium / heavy）
+ *   toimage  = 转图片（PDF 每页渲染成 PNG，逐页上传云存储，返回图片 fileID 列表）
+ *   pages    = 增减页面
+ *       mode 'keep'   删页/提取：job.pageList 如 "1-3,5,7"（保留这些页，其余删除）
+ *       mode 'append' 加页/合并：把 job.fileID2 整本追加到末尾
+ *       mode 'insert' 加页/插入：把 job.fileID2 插入到第 job.at 页之后
+ *
+ * 架构：本服务只做后台 worker——轮询云数据库 compress_jobs 里 status='pending' 的任务，
+ * 取走后处理，把结果上传云存储并写回 status='done' / 'error'。
+ * 小程序不直接调用本服务，而是：上传文件 → 调 pdfCompressJob 云函数建任务 → 轮询 pdfCompressStatus。
+ *
+ * 写库一律用 .set()（已验证 tcb-admin-node 的 .update() 在本环境返回假成功、不落库）。
+ * 认领任务时整篇 set 为 processing，后续轮询 where(status='pending') 查不到，从根本杜绝重复处理。
+ */
+
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const { spawn } = require('child_process')
 const PDFDocument = require('pdf-lib').PDFDocument
 
+// 云开发 Node 管理端 SDK。必须显式传管理员密钥，否则在云托管里不是管理员身份，写库会被安全规则拒绝。
 const tcb = require('tcb-admin-node')
 const app = tcb.init({
   env: process.env.TCB_ENV || process.env.TCB_ENV_ID,
@@ -16,15 +35,16 @@ const db = app.database()
 const COLLECTION = 'compress_jobs'
 const TMP = '/tmp'
 const POLL_INTERVAL_MS = 2000
-const MAX_JOB_AGE_MS = 30 * 60 * 1000
-const STALE_JOB_MS = 10 * 60 * 1000
+const MAX_JOB_AGE_MS = 60 * 60 * 1000 // 1 小时未处理视为过期（500MB 大文件允许更久）
+const STALE_JOB_MS = 15 * 60 * 1000   // 任务卡在 processing 超过 15 分钟才视为失败重试
 
+// 压缩三档预设
 const RASTER_PRESETS = {
-  medium: { dpi: 150, jpegQ: 80 },
-  heavy: { dpi: 90, jpegQ: 55 }
+  heavy: { dpi: 110, jpegQ: 60 } // 重度栅格化：体积大幅下降，文字变图片
 }
 
-function log(...a) { console.log('[pdfCompressRun]', ...a) }
+// ---------- 工具 ----------
+function log(...a) { console.log('[pdfRun]', ...a) }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function runGs(args) {
@@ -35,12 +55,33 @@ function runGs(args) {
     p.on('error', reject)
     p.on('close', code => {
       if (code === 0) resolve()
-      else reject(new Error('gs exited ' + code + ': ' + stderr.slice(0, 800)))
+      else reject(new Error('gs exited ' + code + ': ' + stderr.slice(0, 1000)))
     })
   })
 }
 
+function tmpFile(jobId, suffix) { return path.join(TMP, suffix + '_' + jobId + '.pdf') }
+
+// ---------- 压缩算法 ----------
+// light：轻度，保留文字矢量、仅做温和的流压缩与图片降采样，画质几乎不变，体积小幅下降
 async function compressLight(inputPath, outputPath) {
+  await runGs([
+    '-q', '-dNOPAUSE', '-dBATCH',
+    '-sDEVICE=pdfwrite',
+    '-dCompatibilityLevel=1.4',
+    '-dColorImageDownsampleType=/Bicubic', '-dColorImageResolution=150',
+    '-dGrayImageDownsampleType=/Bicubic', '-dGrayImageResolution=150',
+    '-dMonoImageResolution=300',
+    '-dDownsampleColorImages=true', '-dDownsampleGrayImages=true',
+    '-dEmbedAllFonts=true', '-dSubsetFonts=true',
+    '-dDetectDuplicateImages=true',
+    '-sOutputFile=' + outputPath,
+    inputPath
+  ])
+  return fs.readFileSync(outputPath)
+}
+// medium：中度，整本重新编码（/ebook，图片降到 150DPI），体积中等下降，文字仍矢量
+async function compressMedium(inputPath, outputPath) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
     '-sDEVICE=pdfwrite',
@@ -51,7 +92,7 @@ async function compressLight(inputPath, outputPath) {
   ])
   return fs.readFileSync(outputPath)
 }
-
+// heavy：重度，整页栅格化 → JPEG，体积大幅下降，但文字变为图片、不再可选中
 async function compressRaster(inputPath, outputPath, { dpi, jpegQ }) {
   const inBuf = fs.readFileSync(inputPath)
   const src = await PDFDocument.load(inBuf)
@@ -80,86 +121,163 @@ async function compressRaster(inputPath, outputPath, { dpi, jpegQ }) {
     const { width, height } = pageSizes[i]
     const page = out.addPage([width, height])
     page.drawImage(img, { x: 0, y: 0, width, height })
-    fs.unlinkSync(jpgPath)
+    try { fs.unlinkSync(jpgPath) } catch (_) {}
   }
   const buf = await out.save()
   fs.writeFileSync(outputPath, buf)
   return buf
 }
 
+// ---------- 页面操作 ----------
+// 按页列表提取/删除（用 gs -sPageList，流式处理，内存友好）
+async function gsPageSelect(inputPath, outputPath, pageList) {
+  await runGs([
+    '-q', '-dNOPAUSE', '-dBATCH',
+    '-sDEVICE=pdfwrite',
+    '-dPDFSETTINGS=/default',
+    '-sPageList=' + pageList,
+    '-sOutputFile=' + outputPath,
+    inputPath
+  ])
+  return fs.readFileSync(outputPath)
+}
+// 合并多个 PDF（顺序拼接）
+async function gsMerge(outputPath, inputPaths) {
+  await runGs([
+    '-q', '-dNOPAUSE', '-dBATCH',
+    '-sDEVICE=pdfwrite',
+    '-dPDFSETTINGS=/default',
+    '-sOutputFile=' + outputPath,
+    ...inputPaths
+  ])
+  return fs.readFileSync(outputPath)
+}
+// 取页数
+async function getPageCount(inputPath) {
+  const buf = fs.readFileSync(inputPath)
+  const pdf = await PDFDocument.load(buf)
+  return pdf.getPageCount()
+}
+
+// ---------- 任务处理 ----------
 async function processJob(job) {
   const jobId = job._id
-  const level = job.level
-  const inPath = path.join(TMP, 'in_' + jobId + '.pdf')
-  const outPath = path.join(TMP, 'out_' + jobId + '.pdf')
-  let outBuf = null
+  const op = job.op || 'compress'
+  const now = Date.now()
+  const inPath = tmpFile(jobId, 'in')
+  const outPath = tmpFile(jobId, 'out')
+  const base = {
+    op, level: job.level, fileID: job.fileID,
+    createdAt: job.createdAt || now,
+    status: 'done', finishedAt: now
+  }
   try {
+    // 1) 下载主输入文件
     const dl = await app.downloadFile({ fileID: job.fileID })
-    const inBuf = dl.fileContent
-    fs.writeFileSync(inPath, inBuf)
+    fs.writeFileSync(inPath, dl.fileContent)
+    const inSize = dl.fileContent.length
+    let result = {}
 
-    if (level === 'light') {
-      outBuf = await compressLight(inPath, outPath)
+    if (op === 'compress') {
+      const level = job.level || 'medium'
+      let outBuf
+      if (level === 'light') outBuf = await compressLight(inPath, outPath)
+      else if (level === 'heavy') outBuf = await compressRaster(inPath, outPath, RASTER_PRESETS.heavy)
+      else outBuf = await compressMedium(inPath, outPath)
+      const up = await app.uploadFile({ cloudPath: 'compress/out_' + jobId + '.pdf', fileContent: Buffer.from(outBuf) })
+      result = { outputFileID: up.fileID, originalSize: inSize, compressedSize: outBuf.length, ratio: outBuf.length / inSize }
+
+    } else if (op === 'toimage') {
+      const dpi = job.dpi || 150
+      const dir = path.join(TMP, 'img_' + jobId)
+      fs.mkdirSync(dir, { recursive: true })
+      const pattern = path.join(dir, 'page-%05d.png')
+      await runGs([
+        '-q', '-dNOPAUSE', '-dBATCH',
+        '-sDEVICE=png16m',
+        '-r' + dpi,
+        '-sOutputFile=' + pattern,
+        inPath
+      ])
+      const files = fs.readdirSync(dir).filter(f => f.endsWith('.png')).sort()
+      const ids = []
+      for (const f of files) {
+        const b = fs.readFileSync(path.join(dir, f))
+        const up = await app.uploadFile({ cloudPath: 'compress/img_' + jobId + '_' + f, fileContent: b })
+        ids.push(up.fileID)
+        try { fs.unlinkSync(path.join(dir, f)) } catch (_) {}
+      }
+      try { fs.rmdirSync(dir) } catch (_) {}
+      result = { outputImages: ids, imageCount: ids.length }
+
+    } else if (op === 'pages') {
+      const mode = job.mode || 'keep'
+      let buf
+      if (mode === 'keep') {
+        if (!job.pageList) throw new Error('pages.keep 需要 pageList 参数')
+        buf = await gsPageSelect(inPath, outPath, String(job.pageList))
+      } else if (mode === 'append') {
+        if (!job.fileID2) throw new Error('pages.append 需要 fileID2 参数')
+        const dl2 = await app.downloadFile({ fileID: job.fileID2 })
+        const in2 = tmpFile(jobId, 'in2')
+        fs.writeFileSync(in2, dl2.fileContent)
+        buf = await gsMerge(outPath, [inPath, in2])
+      } else if (mode === 'insert') {
+        if (!job.fileID2) throw new Error('pages.insert 需要 fileID2 参数')
+        const at = parseInt(job.at, 10)
+        if (!at || at < 1) throw new Error('pages.insert 需要有效的 at 参数')
+        const dl2 = await app.downloadFile({ fileID: job.fileID2 })
+        const in2 = tmpFile(jobId, 'in2')
+        fs.writeFileSync(in2, dl2.fileContent)
+        const total = await getPageCount(inPath)
+        const a1 = tmpFile(jobId, 'a1')
+        const a2 = tmpFile(jobId, 'a2')
+        await gsPageSelect(inPath, a1, '1-' + at)
+        await gsPageSelect(inPath, a2, (at + 1) + '-' + total)
+        buf = await gsMerge(outPath, [a1, in2, a2])
+      } else {
+        throw new Error('未知的 pages.mode: ' + mode)
+      }
+      const up = await app.uploadFile({ cloudPath: 'compress/out_' + jobId + '.pdf', fileContent: Buffer.from(buf) })
+      result = { outputFileID: up.fileID, originalSize: inSize, compressedSize: buf.length, ratio: buf.length / inSize }
     } else {
-      const preset = RASTER_PRESETS[level] || RASTER_PRESETS.medium
-      outBuf = await compressRaster(inPath, outPath, preset)
+      throw new Error('未知操作 op: ' + op)
     }
 
-    const up = await app.uploadFile({
-      cloudPath: 'compress/out_' + jobId + '.pdf',
-      fileContent: Buffer.from(outBuf)
-    })
-
-    const now = Date.now()
+    const finalData = Object.assign({}, base, result)
     try {
-      await db.collection(COLLECTION).doc(jobId).set({
-        data: {
-          level: job.level,
-          fileID: job.fileID,
-          createdAt: job.createdAt || now,
-          status: 'done',
-          outputFileID: up.fileID,
-          originalSize: inBuf.length,
-          compressedSize: outBuf.length,
-          ratio: outBuf.length / inBuf.length,
-          finishedAt: now
-        }
-      })
-      log('done', jobId, level, inBuf.length, '->', outBuf.length)
+      await db.collection(COLLECTION).doc(jobId).set(finalData)
+      const summary = result.compressedSize ? `${inSize} -> ${result.compressedSize}` : (result.imageCount ? `${result.imageCount} images` : 'ok')
+      log('done', jobId, op, summary)
     } catch (se) {
       log('DONE-WRITE-FAILED', jobId, se.message)
     }
   } catch (e) {
     log('error', jobId, e.message)
     try {
-      const now = Date.now()
+      const now2 = Date.now()
       await db.collection(COLLECTION).doc(jobId).set({
-        data: {
-          level: job.level,
-          fileID: job.fileID,
-          createdAt: job.createdAt || now,
-          status: 'error',
-          error: String(e.message || e),
-          finishedAt: now
-        }
+        op, level: job.level, fileID: job.fileID,
+        createdAt: job.createdAt || now2,
+        status: 'error', error: String(e.message || e), finishedAt: now2
       })
     } catch (se) {
       log('ERROR-WRITE-FAILED', jobId, se.message)
     }
   } finally {
-    try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath) } catch (_) {}
-    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath) } catch (_) {}
+    for (const s of ['in', 'out', 'in2', 'a1', 'a2']) {
+      try { const p = tmpFile(jobId, s); if (fs.existsSync(p)) fs.unlinkSync(p) } catch (_) {}
+    }
     try {
       const dir = fs.readdirSync(TMP)
       for (const f of dir) {
-        if (f.startsWith('r_' + process.pid + '_')) {
-          try { fs.unlinkSync(path.join(TMP, f)) } catch (_) {}
-        }
+        if (f.startsWith('r_' + process.pid + '_')) { try { fs.unlinkSync(path.join(TMP, f)) } catch (_) {} }
       }
     } catch (_) {}
   }
 }
 
+// ---------- 后台轮询 worker ----------
 async function pollOnce() {
   try {
     const now = Date.now()
@@ -171,14 +289,18 @@ async function pollOnce() {
     for (const job of jobs) {
       try {
         await db.collection(COLLECTION).doc(job._id).set({
-          data: {
-            level: job.level,
-            fileID: job.fileID,
-            createdAt: job.createdAt || now,
-            status: 'processing',
-            startedAt: now,
-            attempts: (job.attempts || 0) + 1
-          }
+          op: job.op || 'compress',
+          level: job.level,
+          fileID: job.fileID,
+          fileID2: job.fileID2,
+          mode: job.mode,
+          pageList: job.pageList,
+          at: job.at,
+          dpi: job.dpi,
+          createdAt: job.createdAt || now,
+          status: 'processing',
+          startedAt: now,
+          attempts: (job.attempts || 0) + 1
         })
         await processJob(job)
       } catch (se) {
@@ -200,9 +322,9 @@ async function loop() {
     const staleJobs = (staleRes && staleRes.data) || []
     let resetCount = 0
     for (const s of staleJobs) {
-      await db.collection(COLLECTION).doc(s._id).set({
-        data: { status: 'pending', startedAt: null, attempts: (s.attempts || 0) + 1 }
-      })
+      const resetData = Object.assign({}, s, { status: 'pending', startedAt: null, attempts: (s.attempts || 0) + 1 })
+      delete resetData._id
+      await db.collection(COLLECTION).doc(s._id).set(resetData)
       resetCount++
     }
     log('reset stale processing jobs', resetCount)
@@ -213,23 +335,29 @@ async function loop() {
   }
 }
 
+// ---------- HTTP 服务（CloudBase Run 健康探针）----------
 const PORT = process.env.PORT || 8080
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
-    res.end('pdfCompressRun ok')
+    res.end('pdfRun ok')
   } else {
     res.writeHead(404)
     res.end('not found')
   }
 })
 
+// ---------- 启动自检：确认能以管理员身份写入数据库，且结构正确 ----------
 async function selfCheck() {
   try {
     const testId = 'selftest_' + Date.now()
-    await db.collection(COLLECTION).doc(testId).set({ data: { _test: true, _ts: Date.now() } })
+    const ts = Date.now()
+    await db.collection(COLLECTION).doc(testId).set({ _test: true, _ts: ts })
+    const r = await db.collection(COLLECTION).doc(testId).get()
+    const ok = r && r.data && r.data._test === true && r.data._ts === ts
     await db.collection(COLLECTION).doc(testId).remove()
-    log('SELF-CHECK: db WRITE ok (admin identity works)')
+    if (ok) log('SELF-CHECK: db WRITE ok (structure correct)')
+    else log('SELF-CHECK: db WRITE STRUCTURE WRONG ->', JSON.stringify(r && r.data).slice(0, 200))
   } catch (e) {
     log('SELF-CHECK: db WRITE FAILED ->', e.message)
   }
@@ -238,5 +366,5 @@ async function selfCheck() {
 server.listen(PORT, () => {
   log('listening on', PORT)
   selfCheck()
-  loop()
+  loop() // 启动后台 worker
 })
