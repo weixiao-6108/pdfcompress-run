@@ -1,7 +1,7 @@
 {
   "name": "pdfCompressRun",
-  "version": "15.0.0",
-  "description": "CloudBase Run 压缩服务 v15 - 三档独立算法 + ghostscript 栅格化 + 异步任务",
+  "version": "19.0.0",
+  "description": "CloudBase Run 压缩服务 v19 - 三档独立算法：qpdf 轻度 / pdftoppm 中重度栅格化",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
