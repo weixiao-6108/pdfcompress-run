@@ -1,20 +1,10 @@
 'use strict'
 /*
- * CloudBase Run PDF 处理服务（v18，多功能）
+ * CloudBase Run PDF 处理服务（v18，多功能 + 加速 + 中文字体嵌入）
  * 支持三种操作（job.op）：
  *   compress = 压缩（三档：light / medium / heavy）
- *   toimage  = 转图片（PDF 每页渲染成 PNG，逐页上传云存储，返回图片 fileID 列表）
- *   pages    = 增减页面
- *       mode 'keep'   删页/提取：job.pageList 如 "1-3,5,7"（保留这些页，其余删除）
- *       mode 'append' 加页/合并：把 job.fileID2 整本追加到末尾
- *       mode 'insert' 加页/插入：把 job.fileID2 插入到第 job.at 页之后
- *
- * 架构：本服务只做后台 worker——轮询云数据库 compress_jobs 里 status='pending' 的任务，
- * 取走后处理，把结果上传云存储并写回 status='done' / 'error'。
- * 小程序不直接调用本服务，而是：上传文件 → 调 pdfCompressJob 云函数建任务 → 轮询 pdfCompressStatus。
- *
- * 写库一律用 .set()（已验证 tcb-admin-node 的 .update() 在本环境返回假成功、不落库）。
- * 认领任务时整篇 set 为 processing，后续轮询 where(status='pending') 查不到，从根本杜绝重复处理。
+ *   toimage  = 转图片（PDF 每页渲染成 PNG）
+ *   pages    = 增减页面（keep 删页 / append 合并 / insert 插入）
  */
 
 const http = require('http')
@@ -23,7 +13,6 @@ const path = require('path')
 const { spawn } = require('child_process')
 const PDFDocument = require('pdf-lib').PDFDocument
 
-// 云开发 Node 管理端 SDK。必须显式传管理员密钥，否则在云托管里不是管理员身份，写库会被安全规则拒绝。
 const tcb = require('tcb-admin-node')
 const app = tcb.init({
   env: process.env.TCB_ENV || process.env.TCB_ENV_ID,
@@ -35,21 +24,19 @@ const db = app.database()
 const COLLECTION = 'compress_jobs'
 const TMP = '/tmp'
 const POLL_INTERVAL_MS = 2000
-const MAX_JOB_AGE_MS = 60 * 60 * 1000 // 1 小时未处理视为过期（500MB 大文件允许更久）
-const STALE_JOB_MS = 15 * 60 * 1000   // 任务卡在 processing 超过 15 分钟才视为失败重试
+const MAX_JOB_AGE_MS = 60 * 60 * 1000
+const STALE_JOB_MS = 15 * 60 * 1000
 
-// 压缩三档预设
-const RASTER_PRESETS = {
-  heavy: { dpi: 110, jpegQ: 60 } // 重度栅格化：体积大幅下降，文字变图片
-}
+const RASTER_PRESETS = { heavy: { dpi: 110, jpegQ: 60 } }
 
-// ---------- 工具 ----------
 function log(...a) { console.log('[pdfRun]', ...a) }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function runGs(args) {
+  // 多核并行渲染，提升压缩速度（容器单核时自动退化为串行，无副作用）
+  const gsArgs = ['-dNumRenderingThreads=4', '-dNOOUTERSAVE', ...args]
   return new Promise((resolve, reject) => {
-    const p = spawn('gs', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const p = spawn('gs', gsArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''
     p.stderr.on('data', d => { stderr += d.toString() })
     p.on('error', reject)
@@ -63,29 +50,35 @@ function runGs(args) {
 function tmpFile(jobId, suffix) { return path.join(TMP, suffix + '_' + jobId + '.pdf') }
 
 // ---------- 压缩算法 ----------
-// light：轻度，不降低图片分辨率，不强制嵌入/子集化字体，仅做整本重新编码与去重，体积轻微下降，文字清晰度不变
+// light：轻度，图片降到 200DPI，文字矢量保留并强制嵌入中文字体，体积轻微下降、中文不乱码
 async function compressLight(inputPath, outputPath) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
     '-sDEVICE=pdfwrite',
-    '-dPDFSETTINGS=/prepress',
-    '-dDownsampleColorImages=false',
-    '-dDownsampleGrayImages=false',
-    '-dDownsampleMonoImages=false',
-    '-dEmbedAllFonts=false',
-    '-dSubsetFonts=false',
+    '-dPDFSETTINGS=/default',
+    '-dColorImageDownsampleType=/Bicubic',
+    '-dColorImageResolution=200',
+    '-dGrayImageDownsampleType=/Bicubic',
+    '-dGrayImageResolution=200',
+    '-dMonoImageResolution=300',
+    '-dDownsampleColorImages=true',
+    '-dDownsampleGrayImages=true',
+    '-dEmbedAllFonts=true',
+    '-dSubsetFonts=true',
     '-dDetectDuplicateImages=true',
     '-sOutputFile=' + outputPath,
     inputPath
   ])
   return fs.readFileSync(outputPath)
 }
-// medium：中度，整本重新编码（/ebook，图片降到 150DPI），体积中等下降，文字仍矢量
+// medium：中度，/ebook（图片降到 150DPI），文字仍矢量，强制嵌入字体避免中文乱码
 async function compressMedium(inputPath, outputPath) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
     '-sDEVICE=pdfwrite',
     '-dPDFSETTINGS=/ebook',
+    '-dEmbedAllFonts=true',
+    '-dSubsetFonts=true',
     '-dDetectDuplicateImages=true',
     '-sOutputFile=' + outputPath,
     inputPath
@@ -117,7 +110,7 @@ async function compressRaster(inputPath, outputPath, { dpi, jpegQ }) {
   for (let i = 0; i < n; i++) {
     const jpgPath = prefix + String(i + 1).padStart(3, '0') + '.jpg'
     const imgBytes = fs.readFileSync(jpgPath)
-    const img = await out.embedJpeg(imgBytes)
+    const img = await out.embedJpg(imgBytes)
     const { width, height } = pageSizes[i]
     const page = out.addPage([width, height])
     page.drawImage(img, { x: 0, y: 0, width, height })
@@ -129,7 +122,6 @@ async function compressRaster(inputPath, outputPath, { dpi, jpegQ }) {
 }
 
 // ---------- 页面操作 ----------
-// 按页列表提取/删除（用 gs -sPageList，流式处理，内存友好）
 async function gsPageSelect(inputPath, outputPath, pageList) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
@@ -141,7 +133,6 @@ async function gsPageSelect(inputPath, outputPath, pageList) {
   ])
   return fs.readFileSync(outputPath)
 }
-// 合并多个 PDF（顺序拼接）
 async function gsMerge(outputPath, inputPaths) {
   await runGs([
     '-q', '-dNOPAUSE', '-dBATCH',
@@ -152,7 +143,6 @@ async function gsMerge(outputPath, inputPaths) {
   ])
   return fs.readFileSync(outputPath)
 }
-// 取页数
 async function getPageCount(inputPath) {
   const buf = fs.readFileSync(inputPath)
   const pdf = await PDFDocument.load(buf)
@@ -165,14 +155,13 @@ async function processJob(job) {
   const op = job.op || 'compress'
   const now = Date.now()
   const inPath = tmpFile(jobId, 'in')
-  const outPath = tmpFile(jobId, 'out')
+  const outPath = tmpFile(jobId / 1)
   const base = {
     op, level: job.level, fileID: job.fileID,
     createdAt: job.createdAt || now,
     status: 'done', finishedAt: now
   }
   try {
-    // 1) 下载主输入文件
     const dl = await app.downloadFile({ fileID: job.fileID })
     fs.writeFileSync(inPath, dl.fileContent)
     const inSize = dl.fileContent.length
@@ -347,14 +336,12 @@ const server = http.createServer((req, res) => {
   }
 })
 
-// ---------- 启动自检：确认能以管理员身份写入数据库，且结构正确 ----------
 async function selfCheck() {
   try {
     const testId = 'selftest_' + Date.now()
     const ts = Date.now()
     await db.collection(COLLECTION).doc(testId).set({ _test: true, _ts: ts })
     const r = await db.collection(COLLECTION).doc(testId).get()
-    // tcb-admin-node 的 .doc(id).get() 返回 r.data 为数组，单文档在 r.data[0]
     const doc = (r && Array.isArray(r.data)) ? r.data[0] : (r && r.data)
     const ok = doc && doc._test === true && doc._ts === ts
     await db.collection(COLLECTION).doc(testId).remove()
@@ -368,5 +355,5 @@ async function selfCheck() {
 server.listen(PORT, () => {
   log('listening on', PORT)
   selfCheck()
-  loop() // 启动后台 worker
+  loop()
 })
