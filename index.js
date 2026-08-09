@@ -107,7 +107,7 @@ async function compressLight(inputPath, outputPath) {
     '--compress-streams=y',
     '--recompress-flate',
     '--optimize-images',
-    '--jpeg-quality=' + (process.env.LIGHT_JPEG_Q || 82),
+    '--jpeg-quality=' + (process.env.LIGHT_JPEG_Q || 75),
     inputPath,
     outputPath
   ])
