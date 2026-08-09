@@ -1,54 +1,25 @@
-# ---------- Stage 1: build qpdf 12.3.2 from source (single RUN, native crypto) ----------
-# 之前 v19.3 失败原因：多 RUN 分层 + cmake 编译链在 CloudBase 构建器里某条命令退出 127（命令找不到）。
-# 改为「单条 RUN」一次性装依赖 + 下载 + 编译 + 安装 + 校验，杜绝分层/PATH 问题；
-# 用 REQUIRE_CRYPTO_NATIVE=1 让 libqpdf 自带原生加密实现，运行时不再依赖 gnutls/openssl。
-# Debian Bookworm（node:18-slim 基础镜像）自带 qpdf 11.3，不支持 --jpeg-quality（12.1.0 才加入），
-# 因此源码编译 12.3.2。下载源带 github 备用，避免单一镜像源不可达。
-FROM node:18-slim AS qpdf-builder
+# v19.5 — 用自带 qpdf 12 的 Debian Trixie 基础镜像，彻底避免源码编译。
+# 之前 v19.3/v19.4 反复在 CloudBase 构建器里 exit 127（卡在 cmake 编译链），
+# 根因是 CloudBase 构建环境跑 cmake 源码编译不稳。本方案：
+#   - debian:trixie-slim 自带 qpdf 12.2.0（>= 12.1.0，支持 --jpeg-quality），
+#     用 apt 直接装，零编译、零下载、无 cmake/curl，从根上消除 127。
+#   - 同时自带 nodejs 20 LTS，glibc 与 qpdf 一致，运行无兼容问题。
+FROM debian:trixie-slim
 
-RUN set -e \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends \
-       build-essential \
-       cmake \
-       curl \
-       ca-certificates \
-       libjpeg-dev \
-       zlib1g-dev \
-  && rm -rf /var/lib/apt/lists/* \
-  && ( curl -fsSL --retry 3 --retry-delay 5 -o /tmp/qpdf.tar.gz \
-         "http://deb.debian.org/debian/pool/main/q/qpdf/qpdf_12.3.2.orig.tar.gz" \
-     || curl -fsSL --retry 3 --retry-delay 5 -o /tmp/qpdf.tar.gz \
-         "https://github.com/qpdf/qpdf/releases/download/v12.3.2/qpdf-12.3.2.tar.gz" ) \
-  && tar xzf /tmp/qpdf.tar.gz -C /tmp \
-  && cd /tmp/qpdf-12.3.2 \
-  && cmake -S . -B build \
-       -DCMAKE_BUILD_TYPE=Release \
-       -DCMAKE_INSTALL_PREFIX=/usr/local \
-       -DREQUIRE_CRYPTO_NATIVE=1 \
-  && cmake --build build -j"$(nproc)" \
-  && cmake --install build \
-  && cd / \
-  && rm -rf /tmp/qpdf-12.3.2 /tmp/qpdf.tar.gz \
-  && qpdf --version
-
-# ---------- Stage 2: runtime ----------
-FROM node:18-slim
-
-# 运行时只需 ghostscript/poppler/字体 + libjpeg/zlib（native crypto 无需额外加密库）
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
+       nodejs \
+       npm \
+       qpdf \
        ghostscript \
        poppler-utils \
        fonts-wqy-zenhei \
        fonts-wqy-microhei \
        libjpeg62-turbo \
        zlib1g \
-  && rm -rf /var/lib/apt/lists/*
-
-COPY --from=qpdf-builder /usr/local/bin/qpdf /usr/local/bin/qpdf
-COPY --from=qpdf-builder /usr/local/lib/libqpdf.so* /usr/local/lib/
-ENV LD_LIBRARY_PATH=/usr/local/lib
+       ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && qpdf --version
 
 # 让 Ghostscript 能找到系统字体
 ENV GS_FONTPATH=/usr/share/fonts
