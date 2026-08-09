@@ -17,7 +17,7 @@
  * 认领任务时整篇 set 为 processing，后续轮询 where(status='pending') 查不到，从根本杜绝重复处理。
  *
  * 压缩算法（v19.3，修复容器 qpdf 版本过低导致 --jpeg-quality 报错）：
- *   light  : qpdf 结构优化 + 仅重编码内嵌图片（--jpeg-quality 旋钮，默认 82≈10~15%），文字层原样保留，绝不乱码。
+ *   light  : qpdf 结构优化 + 仅重编码内嵌图片（--jpeg-quality 旋钮，默认 68≈14~15%），文字层原样保留，绝不乱码。
  *   medium : pdftoppm 整页栅格化 150DPI / JPEG quality 80，文字变软但不会有字体乱码，旋转由 pdftoppm 自动处理。
  *   heavy  : pdftoppm 整页栅格化 90DPI  / JPEG quality 60，体积最小。
  */
@@ -95,14 +95,15 @@ function runGs(args) {
 function tmpFile(jobId, suffix) { return path.join(TMP, suffix + '_' + jobId + '.pdf') }
 
 // ---------- 压缩算法 ----------
-// light：轻度。沿用 v19 安全的 qpdf 结构优化（线性化、对象流、流压缩），
+// light：轻度。沿用 v19 安全的 qpdf 结构优化（对象流、流压缩），
 // 额外只【重新编码内嵌的图片】（--optimize-images + --jpeg-quality），完全不碰文字/矢量层，
 // 因此绝不可能出现乱码，且降幅可用下面这一个旋钮精确控制。
+// 速度优化：已移除 --linearize（网页线性化会做整文件第二遍写盘，对压缩工具无意义，纯耗时），
+// 仅保留开销极小的结构优化，重编码图片仍是主要耗时（qpdf 单线程，大文件几分钟属正常）。
 //   ★ 唯一旋钮：--jpeg-quality （100=几乎不压，越小压得越狠）
-//   对图多型 PDF，82≈10~15%、75≈20~30%、65≈30%+。文字层原样保留，永远不乱码。
+//   对图多型 PDF，68≈14~15%（已定为默认）、62≈20%、82≈10%。文字层原样保留，永远不乱码。
 async function compressLight(inputPath, outputPath) {
   await runCmd('qpdf', [
-    '--linearize',
     '--object-streams=generate',
     '--compress-streams=y',
     '--recompress-flate',
