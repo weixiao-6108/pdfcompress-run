@@ -16,7 +16,7 @@
  * 写库一律用 .set()（已验证 tcb-admin-node 的 .update() 在本环境返回假成功、不落库）。
  * 认领任务时整篇 set 为 processing，后续轮询 where(status='pending') 查不到，从根本杜绝重复处理。
  *
- * 压缩算法（v19.2，轻度档回退为 qpdf 安全方案）：
+ * 压缩算法（v19.3，修复容器 qpdf 版本过低导致 --jpeg-quality 报错）：
  *   light  : qpdf 结构优化 + 仅重编码内嵌图片（--jpeg-quality 旋钮，默认 82≈10~15%），文字层原样保留，绝不乱码。
  *   medium : pdftoppm 整页栅格化 150DPI / JPEG quality 80，文字变软但不会有字体乱码，旋转由 pdftoppm 自动处理。
  *   heavy  : pdftoppm 整页栅格化 90DPI  / JPEG quality 60，体积最小。
@@ -386,6 +386,34 @@ const server = http.createServer((req, res) => {
   }
 })
 
+// ---------- 启动自检：确认工具版本 & 关键参数可用 ----------
+async function checkTools() {
+  try {
+    const ver = await new Promise((resolve, reject) => {
+      const p = spawn('qpdf', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      p.stdout.on('data', d => { out += d.toString() })
+      p.on('error', reject)
+      p.on('close', code => { if (code === 0) resolve(out.trim().split('\n')[0]); else reject(new Error('exit ' + code)) })
+    })
+    log('TOOL-CHECK qpdf:', ver)
+  } catch (e) {
+    log('TOOL-CHECK qpdf: FAILED ->', e.message)
+  }
+
+  // 校验当前 qpdf 是否认识 --jpeg-quality（Bookworm 自带的 11.3 会报错 unrecognized）
+  try {
+    const checkFile = path.join(TMP, 'qpdf_jpeg_quality_check_' + process.pid + '.pdf')
+    await runCmd('qpdf', ['--jpeg-quality=82', '--empty', checkFile])
+    const ok = fs.existsSync(checkFile) && fs.statSync(checkFile).size > 0
+    try { fs.unlinkSync(checkFile) } catch (_) {}
+    if (ok) log('TOOL-CHECK qpdf --jpeg-quality: supported')
+    else log('TOOL-CHECK qpdf --jpeg-quality: UNKNOWN RESULT')
+  } catch (e) {
+    log('TOOL-CHECK qpdf --jpeg-quality: NOT SUPPORTED ->', e.message)
+  }
+}
+
 // ---------- 启动自检：确认能以管理员身份写入数据库，且结构正确 ----------
 async function selfCheck() {
   try {
@@ -410,6 +438,7 @@ module.exports = { compressLight, compressRaster, runCmd, runGs }
 if (require.main === module) {
   server.listen(PORT, () => {
     log('listening on', PORT)
+    checkTools()
     selfCheck()
     loop() // 启动后台 worker
   })
